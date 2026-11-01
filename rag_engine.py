@@ -7,6 +7,7 @@ import numpy as np
 import faiss
 from pypdf import PdfReader
 import google.generativeai as genai
+from rank_bm25 import BM25Okapi
 
 GOOGLE_EMBEDDING_MODEL = "models/gemini-embedding-2"
 GOOGLE_LLM_MODEL = "models/gemini-2.5-flash"
@@ -22,6 +23,7 @@ class RAGEngine:
         self.llm = genai.GenerativeModel(GOOGLE_LLM_MODEL)
         self.index: Optional[faiss.IndexFlatIP] = None
         self.chunks: list[str] = []
+        self.bm25: Optional[BM25Okapi] = None
 
     # ------------------------------------------------------------------ #
     # Ingestion
@@ -66,6 +68,8 @@ class RAGEngine:
 
     def build_index(self, chunks: list[str]) -> None:
         self.chunks = chunks
+        tokenized = [c.lower().split() for c in self.chunks]
+        self.bm25 = BM25Okapi(tokenized)
 
         embeddings = np.vstack([self.embed_document(c) for c in self.chunks])
         faiss.normalize_L2(embeddings)
@@ -79,6 +83,8 @@ class RAGEngine:
         faiss.write_index(self.index, f"{save_dir}/index.faiss")
         with open(f"{save_dir}/chunks.pkl", "wb") as f:
             pickle.dump(self.chunks, f)
+        with open(f"{save_dir}/bm25.pkl", "wb") as f:
+            pickle.dump(self.bm25, f)
 
     def load_index(self, load_dir: str = INDEX_DIR) -> bool:
         index_path = Path(load_dir) / "index.faiss"
@@ -88,6 +94,10 @@ class RAGEngine:
         self.index = faiss.read_index(str(index_path))
         with open(chunks_path, "rb") as f:
             self.chunks = pickle.load(f)
+        bm25_path = Path(load_dir) / "bm25.pkl"
+        if bm25_path.exists():
+            with open(bm25_path, "rb") as f:
+                self.bm25 = pickle.load(f)
         return True
 
     def is_ready(self) -> bool:
@@ -102,6 +112,39 @@ class RAGEngine:
         faiss.normalize_L2(q)
         _, indices = self.index.search(q, top_k)
         return [self.chunks[i] for i in indices[0] if 0 <= i < len(self.chunks)]
+
+    def retrieve_hybrid(self, query: str, top_k: int = TOP_K) -> list[str]:
+        if self.bm25 is None:
+            return self.retrieve(query, top_k)
+
+        k_rrf = 60
+        fetch_k = top_k * 3
+
+        # Dense leg
+        q = self.embed_query(query).reshape(1, -1)
+        faiss.normalize_L2(q)
+        _, dense_indices = self.index.search(q, fetch_k)
+        dense_ranks = {
+            idx: rank
+            for rank, idx in enumerate(dense_indices[0])
+            if 0 <= idx < len(self.chunks)
+        }
+
+        # Sparse BM25 leg
+        tokens = query.lower().split()
+        bm25_scores = self.bm25.get_scores(tokens)
+        sparse_indices = np.argsort(bm25_scores)[::-1][:fetch_k]
+        sparse_ranks = {int(idx): rank for rank, idx in enumerate(sparse_indices)}
+
+        # RRF fusion
+        all_indices = set(dense_ranks) | set(sparse_ranks)
+        rrf_scores = {
+            idx: (1 / (k_rrf + dense_ranks[idx]) if idx in dense_ranks else 0)
+               + (1 / (k_rrf + sparse_ranks[idx]) if idx in sparse_ranks else 0)
+            for idx in all_indices
+        }
+        top_indices = sorted(rrf_scores, key=rrf_scores.__getitem__, reverse=True)[:top_k]
+        return [self.chunks[i] for i in top_indices]
 
     # ------------------------------------------------------------------ #
     # Generation
@@ -146,6 +189,6 @@ class RAGEngine:
     ) -> str:
         if not self.is_ready():
             raise RuntimeError("Index not loaded. Call build_index() or load_index() first.")
-        context_chunks = self.retrieve(query)
-        print("context_chunks: ", context_chunks)
+        context_chunks = self.retrieve_hybrid(query)
+        # print("context_chunks: ", context_chunks)
         return self.generate_answer(query, context_chunks, chat_history)
